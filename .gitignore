@@ -6,6 +6,7 @@ auth/
 *.log
 .DS_Store
 downloads
+memories
 auth
 .qodo
 package-lock.json

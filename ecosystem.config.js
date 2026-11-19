@@ -4,7 +4,7 @@ module.exports = {
       name: 'botwa',
       script: 'index.js',
       watch: false, // Disarankan false untuk kestabilan tinggi
-      ignore_watch: ['node_modules', 'auth', 'downloads'],
+      ignore_watch: ['node_modules', 'auth', 'downloads', 'memories'],
       max_memory_restart: '500M',
       env: {
         NODE_ENV: 'production'
