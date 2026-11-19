@@ -25,7 +25,7 @@ const { Sticker, StickerTypes } = require("wa-sticker-formatter")
 // ================= CONFIG =================
 const OWNER = process.env.OWNER || "6288291045579@s.whatsapp.net"
 const TARGET_LID = process.env.TARGET_LID || "247369195061455@lid"
-const WEBHOOK_PORT = process.env.WEBHOOK_PORT || 3000
+const WEBHOOK_PORT = process.env.PORT || process.env.WEBHOOK_PORT || 3000
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "KODE_RAHASIA_KOM"
 const logger = pino({ level: "silent" })
 
@@ -127,8 +127,22 @@ async function startBot() {
 
   botSock = sock
   sock.ev.on("creds.update", saveCreds)
+
+  // Login pakai kode pairing (tanpa QR). Isi PAIRING_NUMBER di .env, contoh 6288123456789
+  const PAIRING_NUMBER = (process.env.PAIRING_NUMBER || "").replace(/\D/g, "")
+  if (PAIRING_NUMBER && !sock.authState.creds.registered) {
+    setTimeout(async () => {
+      try {
+        const code = await sock.requestPairingCode(PAIRING_NUMBER)
+        console.log(`🔑 KODE PAIRING WHATSAPP: ${code?.match(/.{1,4}/g)?.join("-") || code}`)
+      } catch (err) {
+        console.log("❌ GAGAL MEMINTA KODE PAIRING:", err?.message || err)
+      }
+    }, 3000)
+  }
+
   sock.ev.on("connection.update", (up) => {
-    if (up.qr) qrcode.generate(up.qr, { small: true })
+    if (up.qr && !PAIRING_NUMBER) qrcode.generate(up.qr, { small: true })
     if (up.connection === "open") console.log("✅ BOT CONNECTED")
     if (up.connection === "close") {
       const statusCode = (up.lastDisconnect?.error instanceof Boom) ? up.lastDisconnect.error.output.statusCode : 0
