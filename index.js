@@ -476,9 +476,18 @@ function isTargetEntity(info) {
   return false
 }
 
-function isOwnerEntity(info) {
+function isOwnerEntity(info, sock = activeSock) {
+  if (!info) return false
   const ownerNum = getOwnerNumber()
-  return Boolean(info && ownerNum && info.number === ownerNum)
+  if (ownerNum && info.number === ownerNum) return true
+
+  const myPn = sock?.user?.id ? jidNormalizedUser(sock.user.id) : ""
+  const myLid = sock?.user?.lid ? jidNormalizedUser(sock.user.lid) : ""
+  const myNum = myPn ? myPn.split("@")[0] : ""
+  if (myNum && ownerNum && myNum === ownerNum && myLid) {
+    if (info.lid === myLid || info.raw === myLid) return true
+  }
+  return false
 }
 
 function isQuotedFromMe(sock, contextInfo) {
@@ -1433,9 +1442,9 @@ async function startBot() {
       try {
         const chatInfo = await resolveJidInfo(sock, jid, msg.key.remoteJidAlt)
         const senderInfo = isGroup ? await resolveJidInfo(sock, senderRaw, senderAlt) : chatInfo
-        const isOwnerOrSelf = Boolean(msg.key.fromMe) || isOwnerEntity(senderInfo)
+        const isOwnerOrSelf = Boolean(msg.key.fromMe) || isOwnerEntity(senderInfo, sock)
         const isTargetChat = !isGroup && isTargetEntity(chatInfo)
-        const isOwnerChat = !isGroup && isOwnerEntity(chatInfo)
+        const isOwnerChat = !isGroup && isOwnerEntity(chatInfo, sock)
 
         const body = extractTextFromMessage(msg.message)
         const trimmedBody = body.trim()
