@@ -1228,6 +1228,16 @@ async function handleAntiEdit(sock, key, editedRawMessage) {
   saveMsg(originalId, chatJid, editedRawMessage)
 }
 
+// ================= PANEL HTTP PORT (status saja, tanpa Express) =================
+// Panel mewajibkan app listen di 0.0.0.0:PORT agar terbaca dari luar.
+const PANEL_PORT = Number(process.env.PORT || process.env.SERVER_PORT || 3000)
+require("http")
+  .createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" })
+    res.end("Bot WA berjalan")
+  })
+  .listen(PANEL_PORT, "0.0.0.0", () => console.log(`🌐 HTTP READY ON PORT ${PANEL_PORT}`))
+
 // ================= BOT ENGINE =================
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState("./auth")
