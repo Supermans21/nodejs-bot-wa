@@ -7,6 +7,7 @@ const {
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   Browsers,
+  BufferJSON,
   normalizeMessageContent,
   getContentType,
   isLidUser,
@@ -125,6 +126,7 @@ db.exec(`
 
 // Prepared Statements
 const stmtSaveMsg = db.prepare(`INSERT OR REPLACE INTO messages (id, jid, message, timestamp) VALUES (?, ?, ?, ?)`)
+const stmtSaveMsgIfMissing = db.prepare(`INSERT OR IGNORE INTO messages (id, jid, message, timestamp) VALUES (?, ?, ?, ?)`)
 const stmtGetMsg = db.prepare(`SELECT message FROM messages WHERE id = ?`)
 const stmtDeleteOldMsg = db.prepare(`DELETE FROM messages WHERE timestamp < ?`)
 const stmtCountMsg = db.prepare(`SELECT COUNT(*) AS total FROM messages`)
@@ -147,6 +149,7 @@ const stmtInsertVault = db.prepare(
   `INSERT OR IGNORE INTO vault_items (msg_id, source, media_type, file_path, month_key, caption, is_favorite, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
 )
 const stmtGetVaultByMsg = db.prepare(`SELECT * FROM vault_items WHERE msg_id = ?`)
+const stmtUpdateVaultPath = db.prepare(`UPDATE vault_items SET file_path = ? WHERE msg_id = ?`)
 const stmtSetVaultFavorite = db.prepare(`UPDATE vault_items SET is_favorite = 1 WHERE msg_id = ?`)
 const stmtVaultSummaryByMonth = db.prepare(
   `SELECT month_key, media_type, COUNT(*) AS cnt FROM vault_items GROUP BY month_key, media_type ORDER BY month_key DESC`
@@ -243,21 +246,79 @@ if (/^\d{4}-\d{2}-\d{2}$/.test(ANNIV_DATE_ENV) && !stmtGetAnniv.get()) {
 }
 
 // ================= DB HELPERS & AUTO-CLEANUP =================
+function messageJsonReviver(key, value) {
+  if (value && typeof value === "object" && value.type === "Buffer" && Array.isArray(value.data)) {
+    return Buffer.from(value.data)
+  }
+  return BufferJSON.reviver(key, value)
+}
+
 const saveMsg = (id, jid, message) => {
+  if (!id || !message) return
   try {
-    stmtSaveMsg.run(id, jid, JSON.stringify(message), Date.now())
+    const incomingMedia = extractMediaFromMessage(message)
+    if (incomingMedia && !hasDownloadableMediaRef(incomingMedia.msg)) {
+      const existing = getMsg(id)
+      const existingMedia = extractMediaFromMessage(existing)
+      if (existingMedia && hasDownloadableMediaRef(existingMedia.msg)) {
+        return
+      }
+    }
+    stmtSaveMsg.run(id, jid, JSON.stringify(message, BufferJSON.replacer), Date.now())
   } catch (err) {
     console.error("DB save error:", err.message)
   }
 }
 
+const saveMsgIfMissing = (id, jid, message) => {
+  if (!id || !message) return
+  try {
+    stmtSaveMsgIfMissing.run(id, jid, JSON.stringify(message, BufferJSON.replacer), Date.now())
+  } catch (err) {
+    console.error("DB save (if missing) error:", err.message)
+  }
+}
+
 const getMsg = (id) => {
+  if (!id) return null
   try {
     const row = stmtGetMsg.get(id)
-    return row ? JSON.parse(row.message) : null
+    return row ? JSON.parse(row.message, messageJsonReviver) : null
   } catch {
     return null
   }
+}
+
+// Cache sementara di RAM untuk View-Once saat auto_vault OFF + pelacak download in-flight
+const MAX_VO_CACHE_ITEMS = 15
+const MAX_VO_CACHE_BYTES = 15 * 1024 * 1024
+const VO_CACHE_TTL_MS = 2 * 60 * 60 * 1000
+const viewOnceMemCache = new Map()
+const inFlightMediaDownloads = new Map()
+
+function setViewOnceMemCache(msgId, buffer) {
+  if (!msgId || !Buffer.isBuffer(buffer) || !buffer.length || buffer.length > MAX_VO_CACHE_BYTES) return
+  const now = Date.now()
+  for (const [k, v] of viewOnceMemCache.entries()) {
+    if (now - v.ts > VO_CACHE_TTL_MS) viewOnceMemCache.delete(k)
+  }
+  viewOnceMemCache.delete(msgId)
+  viewOnceMemCache.set(msgId, { buffer, ts: now })
+  while (viewOnceMemCache.size > MAX_VO_CACHE_ITEMS) {
+    const oldestKey = viewOnceMemCache.keys().next().value
+    viewOnceMemCache.delete(oldestKey)
+  }
+}
+
+function getViewOnceMemCache(msgId) {
+  if (!msgId) return null
+  const entry = viewOnceMemCache.get(msgId)
+  if (!entry) return null
+  if (Date.now() - entry.ts > VO_CACHE_TTL_MS) {
+    viewOnceMemCache.delete(msgId)
+    return null
+  }
+  return entry.buffer
 }
 
 function cleanupDatabase() {
@@ -328,7 +389,19 @@ function extractTextFromMessage(rawMsg) {
 
 function isViewOnceMessage(rawMsg) {
   if (!rawMsg) return false
-  if (rawMsg.viewOnceMessage || rawMsg.viewOnceMessageV2 || rawMsg.viewOnceMessageV2Extension) return true
+  let cur = rawMsg
+  for (let i = 0; i < 5 && cur; i++) {
+    if (cur.viewOnceMessage || cur.viewOnceMessageV2 || cur.viewOnceMessageV2Extension) return true
+    const inner =
+      cur.ephemeralMessage ||
+      cur.documentWithCaptionMessage ||
+      cur.editedMessage ||
+      cur.associatedChildMessage ||
+      cur.groupStatusMessage ||
+      cur.groupStatusMessageV2
+    if (!inner) break
+    cur = inner.message
+  }
   const m = normalizeMessageContent(rawMsg)
   return Boolean(m?.imageMessage?.viewOnce || m?.videoMessage?.viewOnce || m?.audioMessage?.viewOnce)
 }
@@ -339,6 +412,7 @@ function extractMediaFromMessage(rawMsg) {
   if (m.imageMessage) {
     return {
       kind: "image",
+      downloadType: "image",
       msg: m.imageMessage,
       ext: "jpg",
       mime: (m.imageMessage.mimetype || "image/jpeg").split(";")[0].trim()
@@ -347,14 +421,25 @@ function extractMediaFromMessage(rawMsg) {
   if (m.videoMessage) {
     return {
       kind: "video",
+      downloadType: "video",
       msg: m.videoMessage,
       ext: "mp4",
       mime: (m.videoMessage.mimetype || "video/mp4").split(";")[0].trim()
     }
   }
+  if (m.ptvMessage) {
+    return {
+      kind: "video",
+      downloadType: "ptv",
+      msg: m.ptvMessage,
+      ext: "mp4",
+      mime: (m.ptvMessage.mimetype || "video/mp4").split(";")[0].trim()
+    }
+  }
   if (m.audioMessage) {
     return {
       kind: "audio",
+      downloadType: "audio",
       msg: m.audioMessage,
       ext: "ogg",
       mime: (m.audioMessage.mimetype || "audio/ogg").split(";")[0].trim(),
@@ -365,6 +450,7 @@ function extractMediaFromMessage(rawMsg) {
     const ext = path.extname(m.documentMessage.fileName || "").replace(".", "") || "bin"
     return {
       kind: "document",
+      downloadType: "document",
       msg: m.documentMessage,
       ext,
       mime: (m.documentMessage.mimetype || "application/pdf").split(";")[0].trim(),
@@ -374,11 +460,42 @@ function extractMediaFromMessage(rawMsg) {
   return null
 }
 
+function hasMediaKey(mediaMsg) {
+  if (!mediaMsg?.mediaKey) return false
+  if (Buffer.isBuffer(mediaMsg.mediaKey) || mediaMsg.mediaKey instanceof Uint8Array) {
+    return mediaMsg.mediaKey.length > 0
+  }
+  if (typeof mediaMsg.mediaKey === "string") return mediaMsg.mediaKey.length > 0
+  return false
+}
+
+function hasDownloadableMediaRef(mediaMsg) {
+  if (!mediaMsg) return false
+  return Boolean(mediaMsg.directPath || mediaMsg.url) && hasMediaKey(mediaMsg)
+}
+
+function mediaMetadataFromVault(vaultItem) {
+  if (!vaultItem) return null
+  const extMap = { image: "jpg", video: "mp4", audio: "ogg" }
+  const mimeMap = { image: "image/jpeg", video: "video/mp4", audio: "audio/ogg" }
+  const kind = vaultItem.media_type
+  if (!extMap[kind]) return null
+  const fileExt = vaultItem.file_path ? path.extname(vaultItem.file_path).replace(".", "") : ""
+  return {
+    kind,
+    downloadType: kind,
+    msg: null,
+    ext: fileExt || extMap[kind],
+    mime: mimeMap[kind],
+    ptt: kind === "audio"
+  }
+}
+
 function detectMsgCategory(rawMsg) {
   const m = normalizeMessageContent(rawMsg)
   if (!m) return "other"
   if (m.imageMessage) return "image"
-  if (m.videoMessage) return "video"
+  if (m.videoMessage || m.ptvMessage) return "video"
   if (m.audioMessage) return "audio"
   if (m.stickerMessage) return "sticker"
   if (m.conversation || m.extendedTextMessage) return "text"
@@ -399,6 +516,214 @@ async function downloadStreamToBuffer(mediaMsg, mediaType) {
     chunks.push(chunk)
   }
   return Buffer.concat(chunks)
+}
+
+async function requestMediaReuploadWithTimeout(sock, message, timeoutMs = 12000) {
+  if (!sock?.updateMediaMessage || !message?.key?.id || !message?.message) return null
+  let timer = null
+  const updatePromise = sock.updateMediaMessage(message)
+  updatePromise.catch(() => {})
+  try {
+    return await Promise.race([
+      updatePromise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Media re-upload timeout")), timeoutMs)
+      })
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+async function downloadMediaWithReupload(sock, rawMessage, media, msgKey = null) {
+  if (!media?.msg) throw new Error("Objek media tidak ditemukan")
+  const dlType = media.downloadType || media.kind
+  let lastErr = null
+
+  if (hasDownloadableMediaRef(media.msg)) {
+    try {
+      return await downloadStreamToBuffer(media.msg, dlType)
+    } catch (err) {
+      lastErr = err
+    }
+  }
+
+  // Fallback: minta re-upload dari perangkat pengirim jika mediaKey masih ada
+  if (sock && msgKey?.id && rawMessage && hasMediaKey(media.msg)) {
+    try {
+      const updated = await requestMediaReuploadWithTimeout(sock, { key: msgKey, message: rawMessage })
+      const updatedMedia = extractMediaFromMessage(updated?.message)
+      if (updatedMedia && hasDownloadableMediaRef(updatedMedia.msg)) {
+        if (msgKey.remoteJid) saveMsg(msgKey.id, msgKey.remoteJid, updated.message)
+        return await downloadStreamToBuffer(updatedMedia.msg, updatedMedia.downloadType || updatedMedia.kind)
+      }
+    } catch (reuploadErr) {
+      lastErr = lastErr || reuploadErr
+    }
+  }
+
+  throw lastErr || new Error("No valid media URL or directPath present in message")
+}
+
+function buildQuotedKey(sock, jid, isGroup, contextInfo) {
+  if (!contextInfo?.stanzaId) return null
+  return {
+    remoteJid: contextInfo.remoteJid || jid,
+    id: contextInfo.stanzaId,
+    fromMe: isQuotedFromMe(sock, contextInfo),
+    ...(isGroup && contextInfo.participant ? { participant: contextInfo.participant } : {})
+  }
+}
+
+function resolveQuotedContext(contextInfo) {
+  const stanzaId = contextInfo?.stanzaId || null
+  const quotedRaw = contextInfo?.quotedMessage || null
+  const cachedQuotedRaw = stanzaId ? getMsg(stanzaId) : null
+  const vaultItem = stanzaId ? stmtGetVaultByMsg.get(stanzaId) : null
+  const mediaFromQuoted = extractMediaFromMessage(quotedRaw)
+  const mediaFromCache = extractMediaFromMessage(cachedQuotedRaw)
+  const vaultFileExists = Boolean(vaultItem?.file_path && fs.existsSync(vaultItem.file_path))
+
+  let media = null
+  if (mediaFromCache && hasDownloadableMediaRef(mediaFromCache.msg)) {
+    media = mediaFromCache
+  } else if (mediaFromQuoted) {
+    media = mediaFromQuoted
+  } else if (mediaFromCache) {
+    media = mediaFromCache
+  } else if (vaultFileExists) {
+    media = mediaMetadataFromVault(vaultItem)
+  }
+
+  const isViewOnce = Boolean(
+    isViewOnceMessage(quotedRaw) ||
+      isViewOnceMessage(cachedQuotedRaw) ||
+      vaultItem?.source === "viewonce"
+  )
+  const text = extractTextFromMessage(quotedRaw) || extractTextFromMessage(cachedQuotedRaw) || vaultItem?.caption || ""
+
+  return {
+    stanzaId,
+    quotedRaw,
+    cachedQuotedRaw,
+    vaultItem,
+    mediaFromQuoted,
+    mediaFromCache,
+    media,
+    isViewOnce,
+    text
+  }
+}
+
+async function downloadQuotedMediaBuffer(sock, jid, isGroup, contextInfo, quotedCtx) {
+  const { stanzaId, quotedRaw, cachedQuotedRaw, mediaFromQuoted, mediaFromCache } = quotedCtx
+
+  // 1) Tunggu jika media pesan asli sedang dalam proses download (auto-vault / view-once cache)
+  if (stanzaId && inFlightMediaDownloads.has(stanzaId)) {
+    try {
+      const inFlightBuf = await inFlightMediaDownloads.get(stanzaId)
+      if (Buffer.isBuffer(inFlightBuf) && inFlightBuf.length > 0) return inFlightBuf
+    } catch {}
+  }
+
+  // 2) Cek file yang sudah tersimpan di Memory Vault (paling aman untuk View-Once)
+  const latestVault = stanzaId ? stmtGetVaultByMsg.get(stanzaId) : null
+  if (latestVault?.file_path && fs.existsSync(latestVault.file_path)) {
+    try {
+      const diskBuf = fs.readFileSync(latestVault.file_path)
+      if (diskBuf.length > 0) return diskBuf
+    } catch {}
+  }
+
+  // 3) Cek cache RAM sementara (saat auto_vault dimatikan)
+  const memBuf = getViewOnceMemCache(stanzaId)
+  if (memBuf && memBuf.length > 0) return memBuf
+
+  // 4) Download langsung dari kandidat yang punya URL/directPath + mediaKey (prioritas cache pesan asli -> quoted)
+  const quotedKey = buildQuotedKey(sock, jid, isGroup, contextInfo)
+  const candidates = [
+    { raw: cachedQuotedRaw, media: mediaFromCache, source: "cache" },
+    { raw: quotedRaw, media: mediaFromQuoted, source: "quoted" }
+  ].filter((c) => c.media?.msg)
+
+  let lastErr = null
+
+  // Pass A: Direct download tanpa re-upload dulu (paling cepat)
+  for (const c of candidates) {
+    if (!hasDownloadableMediaRef(c.media.msg)) continue
+    try {
+      return await downloadStreamToBuffer(c.media.msg, c.media.downloadType || c.media.kind)
+    } catch (err) {
+      lastErr = err
+    }
+  }
+
+  // Pass B: Jika direct download gagal (404/410) atau URL/directPath hilang tapi mediaKey masih ada -> minta re-upload
+  for (const c of candidates) {
+    if (!hasMediaKey(c.media.msg)) continue
+    try {
+      return await downloadMediaWithReupload(sock, c.raw, c.media, quotedKey)
+    } catch (err) {
+      lastErr = err
+    }
+  }
+
+  const diag = {
+    stanzaId: stanzaId || "-",
+    quotedHasUrl: Boolean(mediaFromQuoted?.msg?.url || mediaFromQuoted?.msg?.directPath),
+    quotedHasKey: hasMediaKey(mediaFromQuoted?.msg),
+    cacheHasUrl: Boolean(mediaFromCache?.msg?.url || mediaFromCache?.msg?.directPath),
+    cacheHasKey: hasMediaKey(mediaFromCache?.msg),
+    inVault: Boolean(latestVault?.file_path && fs.existsSync(latestVault.file_path))
+  }
+  console.error("⚠️ Media reply tidak dapat diunduh:", JSON.stringify(diag))
+
+  if (lastErr) throw lastErr
+  throw new Error(
+    "Media tidak memiliki URL/directPath/mediaKey di pesan reply dan belum tersimpan di cache/vault bot (kemungkinan dikirim sebelum bot online)."
+  )
+}
+
+function cacheIncomingTargetMedia(sock, msg, directMedia, caption = "") {
+  const id = msg?.key?.id
+  if (!id || !directMedia || !["image", "video", "audio"].includes(directMedia.kind)) return
+
+  const isVO = isViewOnceMessage(msg.message)
+  const shouldVault = isEnabled("auto_vault")
+  const shouldMemCache = !shouldVault && isVO && isEnabled("auto_capture")
+  if (!shouldVault && !shouldMemCache) return
+
+  if (shouldVault) {
+    const existing = stmtGetVaultByMsg.get(id)
+    if (existing?.file_path && fs.existsSync(existing.file_path)) return
+  }
+  if (inFlightMediaDownloads.has(id)) return
+
+  const task = downloadMediaWithReupload(sock, msg.message, directMedia, msg.key)
+    .then((buf) => {
+      if (!Buffer.isBuffer(buf) || !buf.length) return null
+      if (shouldVault) {
+        saveToMemoryVault({
+          msgId: id,
+          source: isVO ? "viewonce" : "chat",
+          media: directMedia,
+          buffer: buf,
+          caption
+        })
+      } else if (shouldMemCache) {
+        setViewOnceMemCache(id, buf)
+      }
+      return buf
+    })
+    .catch((err) => {
+      console.error("Auto-vault/cache error:", err.message)
+      return null
+    })
+    .finally(() => {
+      inFlightMediaDownloads.delete(id)
+    })
+
+  inFlightMediaDownloads.set(id, task)
 }
 
 async function sendMediaToOwner(sock, media, buffer, caption) {
@@ -612,6 +937,11 @@ function buildSpeedReport(daysArg) {
 // ================= 2. MEMORY VAULT OTOMATIS =================
 function saveToMemoryVault({ msgId, source, media, buffer, caption = "", isFavorite = 0 }) {
   try {
+    const existing = msgId ? stmtGetVaultByMsg.get(msgId) : null
+    if (existing && existing.file_path && fs.existsSync(existing.file_path)) {
+      return existing.file_path
+    }
+
     const { monthKey } = getLocalDateParts()
     const monthDir = path.join(MEMORIES_DIR, monthKey)
     if (!fs.existsSync(monthDir)) fs.mkdirSync(monthDir, { recursive: true })
@@ -619,6 +949,11 @@ function saveToMemoryVault({ msgId, source, media, buffer, caption = "", isFavor
     const filename = `${source}_${Date.now()}.${media.ext}`
     const filePath = path.join(monthDir, filename)
     fs.writeFileSync(filePath, buffer)
+
+    if (existing && msgId) {
+      stmtUpdateVaultPath.run(filePath, msgId)
+      return filePath
+    }
 
     stmtInsertVault.run(
       msgId || `${source}_${Date.now()}`,
@@ -1012,6 +1347,7 @@ function triggerPanic(wipeCache = false) {
     setCfg(key, "off")
   }
   setCfg("panic_mode", "on")
+  viewOnceMemCache.clear()
 
   let wipedCount = 0
   if (wipeCache) {
@@ -1384,9 +1720,26 @@ async function startBot() {
     }
   })
 
+  // ================= EVENT: messaging-history.set (CACHE DIAM-DIAM PESAN MEDIA TARGET/OWNER) =================
+  sock.ev.on("messaging-history.set", async ({ messages }) => {
+    if (!Array.isArray(messages) || !messages.length) return
+    for (const msg of messages) {
+      try {
+        if (!msg?.message || !msg?.key?.id || !msg?.key?.remoteJid) continue
+        const jid = msg.key.remoteJid
+        if (jid === "status@broadcast" || jid.endsWith("@g.us")) continue
+        const normalized = normalizeMessageContent(msg.message) || msg.message
+        if (normalized?.protocolMessage || msg.message.protocolMessage) continue
+        const chatInfo = await resolveJidInfo(sock, jid, msg.key.remoteJidAlt)
+        if (!isTargetEntity(chatInfo) && !isOwnerEntity(chatInfo, sock)) continue
+        saveMsgIfMissing(msg.key.id, jid, msg.message)
+      } catch {}
+    }
+  })
+
   // ================= MAIN MESSAGE HANDLER =================
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    if (type !== "notify") return
+    const isLiveNotify = type === "notify"
     for (const msg of messages) {
       if (!msg.message) continue
 
@@ -1395,6 +1748,27 @@ async function startBot() {
 
       const jid = msg.key.remoteJid
       if (!jid) continue
+
+      // Pesan offline/sync (type !== "notify"): simpan cache & media diam-diam tanpa memicu command/notifikasi
+      if (!isLiveNotify) {
+        if (jid === "status@broadcast" || jid.endsWith("@g.us")) continue
+        try {
+          const normalized = normalizeMessageContent(msg.message) || msg.message
+          if (normalized?.protocolMessage || msg.message.protocolMessage) continue
+          const chatInfo = await resolveJidInfo(sock, jid, msg.key.remoteJidAlt)
+          const isTargetChat = isTargetEntity(chatInfo)
+          const isOwnerChat = isOwnerEntity(chatInfo, sock)
+          if (!isTargetChat && !isOwnerChat) continue
+          saveMsgIfMissing(id, jid, msg.message)
+          if (isTargetChat) {
+            const directMedia = extractMediaFromMessage(msg.message)
+            if (directMedia && ["image", "video", "audio"].includes(directMedia.kind)) {
+              cacheIncomingTargetMedia(sock, msg, directMedia, extractTextFromMessage(msg.message))
+            }
+          }
+        } catch {}
+        continue
+      }
 
       // ================= AUTO-CAPTURE STATUS WA TARGET (+ MEMORY VAULT) =================
       if (jid === "status@broadcast") {
@@ -1411,7 +1785,7 @@ async function startBot() {
               (statusCaption ? `\n\nCaption:\n${statusCaption}` : "")
 
             if (statusMedia && ["image", "video", "audio"].includes(statusMedia.kind)) {
-              const buffer = await downloadStreamToBuffer(statusMedia.msg, statusMedia.kind)
+              const buffer = await downloadMediaWithReupload(sock, msg.message, statusMedia, msg.key)
               const vaultPath = isEnabled("auto_vault")
                 ? saveToMemoryVault({
                     msgId: id,
@@ -1452,9 +1826,18 @@ async function startBot() {
         const isDoubleSlashCmd = cmd.startsWith("//")
 
         const contextInfo = getContextInfo(msg.message)
-        const quoted = contextInfo?.quotedMessage || null
-        const quotedMedia = extractMediaFromMessage(quoted)
+        const quotedCtx = resolveQuotedContext(contextInfo)
+        const quotedMedia = quotedCtx.media
+        const isQuotedVO = quotedCtx.isViewOnce
+        const quotedText = quotedCtx.text
         const directMedia = extractMediaFromMessage(msg.message)
+
+        const downloadResolvedMedia = async (useQuoted, mediaObj) => {
+          if (useQuoted) {
+            return downloadQuotedMediaBuffer(sock, jid, isGroup, contextInfo, quotedCtx)
+          }
+          return downloadMediaWithReupload(sock, msg.message, mediaObj, msg.key)
+        }
 
         // ================= LOG CONSOLE SETIAP OWNER REPLY IMAGE (DI CHAT SIAPA PUN - HANYA CONSOLE) =================
         if (isEnabled("image_log") && isOwnerOrSelf && quotedMedia?.kind === "image") {
@@ -1473,7 +1856,7 @@ async function startBot() {
             console.log(`Nomor Foto   : ${quotedSenderInfo.number || "-"}`)
             console.log(`LID Foto     : ${quotedSenderInfo.lid || "-"}`)
           }
-          console.log(`View-Once    : ${isViewOnceMessage(quoted) ? "Ya" : "Tidak"}`)
+          console.log(`View-Once    : ${isQuotedVO ? "Ya" : "Tidak"}`)
           console.log(`Pesan Reply  : ${body || "(tanpa teks)"}`)
           console.log("======================================================\n")
         }
@@ -1481,9 +1864,14 @@ async function startBot() {
         // ================= FILTER KETAT: DI LUAR CHAT TARGET & OWNER CHAT -> STOP =================
         if (!isTargetChat && !isOwnerChat) continue
 
+        // Cache pesan di Owner chat (Message Yourself) agar reply command //dl, //ocr, //ai tetap bisa recover media
+        if (isOwnerChat && !isTargetChat && !protocolMsg && !isDoubleSlashCmd) {
+          saveMsg(id, jid, msg.message)
+        }
+
         // ================= FITUR OTOMATIS KHUSUS CHAT TARGET =================
         if (isTargetChat) {
-          // 1) Simpan pesan ke SQLite untuk Anti-Delete & Anti-Edit (skip protocolMessage & command //)
+          // 1) Simpan pesan ke SQLite untuk Anti-Delete, Anti-Edit, & Recovery Media Reply (skip protocolMessage & command //)
           if (!protocolMsg && !isDoubleSlashCmd) {
             saveMsg(id, jid, msg.message)
 
@@ -1493,31 +1881,56 @@ async function startBot() {
             recordReplyMetricTurn(id, senderRole, now)
             recordCoupleMessage(id, senderRole, msg.message, body, now)
 
-            // 3) Auto Memory Vault (simpan diam-diam foto/video/VN dari chat target ke memories/YYYY-MM/)
-            if (isEnabled("auto_vault") && directMedia && ["image", "video", "audio"].includes(directMedia.kind)) {
-              downloadStreamToBuffer(directMedia.msg, directMedia.kind)
-                .then((buf) => {
-                  const source = isViewOnceMessage(msg.message) ? "viewonce" : "chat"
-                  saveToMemoryVault({
-                    msgId: id,
-                    source,
-                    media: directMedia,
-                    buffer: buf,
-                    caption: body
-                  })
-                })
-                .catch((err) => console.error("Auto-vault error:", err.message))
+            // 3) Auto Memory Vault / Cache View-Once (simpan diam-diam foto/video/VN dari chat target)
+            if (directMedia && ["image", "video", "audio"].includes(directMedia.kind)) {
+              cacheIncomingTargetMedia(sock, msg, directMedia, body)
             }
           }
 
           // 4) ANTI-DELETE (Khusus Chat Target -> Kirim ke Owner)
           if (isEnabled("anti_delete") && protocolMsg?.type === proto.Message.ProtocolMessage.Type.REVOKE) {
-            const old = getMsg(protocolMsg.key.id)
-            if (old) {
-              await sendToOwner(sock, {
-                text: `🚨 *ANTI-DELETE (TARGET)*\nNomor: ${chatInfo.number || getTargetNumber()}${chatInfo.lid ? ` (${chatInfo.lid})` : ""}`
-              })
-              await sendToOwner(sock, { forward: { key: protocolMsg.key, message: old } })
+            const revokedId = protocolMsg.key?.id
+            const old = getMsg(revokedId)
+            const vaulted = revokedId ? stmtGetVaultByMsg.get(revokedId) : null
+            if (old || (vaulted?.file_path && fs.existsSync(vaulted.file_path))) {
+              const header =
+                `🚨 *ANTI-DELETE (TARGET)*\n` +
+                `Nomor: ${chatInfo.number || getTargetNumber()}${chatInfo.lid ? ` (${chatInfo.lid})` : ""}`
+              const oldMedia = extractMediaFromMessage(old) || (vaulted ? mediaMetadataFromVault(vaulted) : null)
+              const oldIsVO = isViewOnceMessage(old) || vaulted?.source === "viewonce"
+
+              if (oldMedia && ["image", "video", "audio"].includes(oldMedia.kind) && (oldIsVO || !old)) {
+                try {
+                  let buf = null
+                  if (vaulted?.file_path && fs.existsSync(vaulted.file_path)) {
+                    buf = fs.readFileSync(vaulted.file_path)
+                  } else if (getViewOnceMemCache(revokedId)) {
+                    buf = getViewOnceMemCache(revokedId)
+                  } else if (old) {
+                    buf = await downloadMediaWithReupload(sock, old, oldMedia, protocolMsg.key)
+                  }
+                  if (buf) {
+                    const oldCap = extractTextFromMessage(old) || vaulted?.caption || ""
+                    await sendMediaToOwner(
+                      sock,
+                      oldMedia,
+                      buf,
+                      `${header}${oldIsVO ? "\nTipe: View-Once" : ""}${oldCap ? `\nCaption: ${oldCap}` : ""}`
+                    )
+                    continue
+                  }
+                } catch {}
+              }
+
+              if (old) {
+                await sendToOwner(sock, { text: header })
+                try {
+                  await sendToOwner(sock, { forward: { key: protocolMsg.key, message: old } })
+                } catch {
+                  const fallbackText = extractTextFromMessage(old)
+                  if (fallbackText) await sendToOwner(sock, { text: fallbackText })
+                }
+              }
             }
             continue
           }
@@ -1768,16 +2181,20 @@ _Tip: Jalankan \`//config\`, \`//wrapped\`, \`//speed\`, atau \`//set\` di chat 
           // ---------- //dl atau //download ----------
           if (cmd === "//dl" || cmd === "//download") {
             if (quotedMedia && ["image", "video", "audio"].includes(quotedMedia.kind)) {
-              if (!fs.existsSync(DOWNLOADS_DIR)) fs.mkdirSync(DOWNLOADS_DIR, { recursive: true })
-              const buffer = await downloadStreamToBuffer(quotedMedia.msg, quotedMedia.kind)
-              const filepath = path.join(DOWNLOADS_DIR, `${Date.now()}.${quotedMedia.ext}`)
-              fs.writeFileSync(filepath, buffer)
+              try {
+                if (!fs.existsSync(DOWNLOADS_DIR)) fs.mkdirSync(DOWNLOADS_DIR, { recursive: true })
+                const buffer = await downloadQuotedMediaBuffer(sock, jid, isGroup, contextInfo, quotedCtx)
+                const filepath = path.join(DOWNLOADS_DIR, `${Date.now()}.${quotedMedia.ext}`)
+                fs.writeFileSync(filepath, buffer)
 
-              const caption =
-                `📥 *DOWNLOADED ${quotedMedia.kind.toUpperCase()}*${isViewOnceMessage(quoted) ? " (VIEW-ONCE)" : ""}\n` +
-                `Source: ${chatInfo.number || chatInfo.lid || getTargetNumber()}\n` +
-                `Saved to: ${filepath}`
-              await sendMediaToOwner(sock, quotedMedia, buffer, caption)
+                const caption =
+                  `📥 *DOWNLOADED ${quotedMedia.kind.toUpperCase()}*${isQuotedVO ? " (VIEW-ONCE)" : ""}\n` +
+                  `Source: ${chatInfo.number || chatInfo.lid || getTargetNumber()}\n` +
+                  `Saved to: ${filepath}`
+                await sendMediaToOwner(sock, quotedMedia, buffer, caption)
+              } catch (err) {
+                await sendToOwner(sock, { text: `❌ Download gagal: ${err.message}` })
+              }
             } else {
               await sendToOwner(sock, { text: `❌ Reply foto, video, atau voice note dengan \`//dl\` untuk mendownload.` })
             }
@@ -1791,7 +2208,7 @@ _Tip: Jalankan \`//config\`, \`//wrapped\`, \`//speed\`, atau \`//set\` di chat 
               continue
             }
             try {
-              const buffer = await downloadStreamToBuffer(quotedMedia.msg, "audio")
+              const buffer = await downloadQuotedMediaBuffer(sock, jid, isGroup, contextInfo, quotedCtx)
               const reply = await callGemini({
                 prompt:
                   "Analisis Voice Note dari pasangan ini dalam bahasa Indonesia dengan format rapi berikut:\n" +
@@ -1813,8 +2230,8 @@ _Tip: Jalankan \`//config\`, \`//wrapped\`, \`//speed\`, atau \`//set\` di chat 
           // ---------- //kode (PENERJEMAH KODE PASANGAN) ----------
           if (cmd === "//kode" || cmd.startsWith("//kode ")) {
             const extraContext = trimmedBody.slice(6).trim()
-            const targetMedia = quotedMedia || directMedia
-            const quotedText = quoted ? extractTextFromMessage(quoted) : ""
+            const useQuoted = Boolean(quotedMedia)
+            const targetMedia = useQuoted ? quotedMedia : directMedia
 
             if (!quotedText && !targetMedia && !extraContext) {
               await sendToOwner(sock, {
@@ -1826,7 +2243,7 @@ _Tip: Jalankan \`//config\`, \`//wrapped\`, \`//speed\`, atau \`//set\` di chat 
             try {
               let buffer = null
               if (targetMedia) {
-                buffer = await downloadStreamToBuffer(targetMedia.msg, targetMedia.kind)
+                buffer = await downloadResolvedMedia(useQuoted, targetMedia)
               }
               const prompt =
                 "Kamu adalah ahli membaca 'kode' dan psikologi komunikasi pasangan. Analisis pesan/media ini dengan format rapi:\n" +
@@ -1847,13 +2264,14 @@ _Tip: Jalankan \`//config\`, \`//wrapped\`, \`//speed\`, atau \`//set\` di chat 
 
           // ---------- //ocr ----------
           if (cmd === "//ocr") {
-            const targetImg = quotedMedia?.kind === "image" ? quotedMedia : (directMedia?.kind === "image" ? directMedia : null)
+            const useQuoted = quotedMedia?.kind === "image"
+            const targetImg = useQuoted ? quotedMedia : (directMedia?.kind === "image" ? directMedia : null)
             if (!targetImg) {
               await sendToOwner(sock, { text: `❌ Reply foto (atau kirim foto dengan caption \`//ocr\`) untuk ekstrak teks.` })
               continue
             }
             try {
-              const buffer = await downloadStreamToBuffer(targetImg.msg, "image")
+              const buffer = await downloadResolvedMedia(useQuoted, targetImg)
               const reply = await callGemini({
                 prompt: "Ekstrak dan salin seluruh teks yang ada di dalam gambar ini secara persis dan rapi tanpa tambahan komentar.",
                 media: targetImg,
@@ -1869,8 +2287,8 @@ _Tip: Jalankan \`//config\`, \`//wrapped\`, \`//speed\`, atau \`//set\` di chat 
           // ---------- //ai ----------
           if (cmd === "//ai" || cmd.startsWith("//ai ")) {
             const userPrompt = trimmedBody.slice(4).trim()
-            const targetMedia = quotedMedia || directMedia
-            const quotedText = quoted ? extractTextFromMessage(quoted) : ""
+            const useQuoted = Boolean(quotedMedia)
+            const targetMedia = useQuoted ? quotedMedia : directMedia
 
             if (!userPrompt && !targetMedia && !quotedText) {
               await sendToOwner(sock, { text: `❌ Contoh: \`//ai ide kado ultah\` atau reply foto/VN/PDF dengan \`//ai ringkas ini\`` })
@@ -1879,7 +2297,7 @@ _Tip: Jalankan \`//config\`, \`//wrapped\`, \`//speed\`, atau \`//set\` di chat 
             try {
               let buffer = null
               if (targetMedia) {
-                buffer = await downloadStreamToBuffer(targetMedia.msg, targetMedia.kind)
+                buffer = await downloadResolvedMedia(useQuoted, targetMedia)
               }
               const finalPrompt =
                 (userPrompt || "Jelaskan atau ringkas isi konten ini secara jelas dan padat.") +
@@ -1959,20 +2377,24 @@ _Tip: Jalankan \`//config\`, \`//wrapped\`, \`//speed\`, atau \`//set\` di chat 
 
           // ---------- //vo (VIEW-ONCE SENDER) ----------
           if (cmd === "//vo") {
-            const targetMedia =
-              quotedMedia && ["image", "video", "audio"].includes(quotedMedia.kind)
-                ? quotedMedia
-                : (directMedia && ["image", "video", "audio"].includes(directMedia.kind) ? directMedia : null)
+            const useQuoted = Boolean(quotedMedia && ["image", "video", "audio"].includes(quotedMedia.kind))
+            const targetMedia = useQuoted
+              ? quotedMedia
+              : (directMedia && ["image", "video", "audio"].includes(directMedia.kind) ? directMedia : null)
 
             if (!targetMedia) {
               await sendToOwner(sock, { text: `❌ Reply foto/video/VN (atau kirim dengan caption \`//vo\`) untuk kirim sebagai View-Once.` })
               continue
             }
-            const buffer = await downloadStreamToBuffer(targetMedia.msg, targetMedia.kind)
-            if (targetMedia.kind === "audio") {
-              await sendToChat(sock, jid, { audio: buffer, mimetype: targetMedia.mime, ptt: true, viewOnce: true })
-            } else {
-              await sendToChat(sock, jid, { [targetMedia.kind]: buffer, viewOnce: true })
+            try {
+              const buffer = await downloadResolvedMedia(useQuoted, targetMedia)
+              if (targetMedia.kind === "audio") {
+                await sendToChat(sock, jid, { audio: buffer, mimetype: targetMedia.mime, ptt: true, viewOnce: true })
+              } else {
+                await sendToChat(sock, jid, { [targetMedia.kind]: buffer, viewOnce: true })
+              }
+            } catch (err) {
+              await sendToOwner(sock, { text: `❌ Kirim View-Once gagal: ${err.message}` })
             }
             continue
           }
@@ -1982,23 +2404,31 @@ _Tip: Jalankan \`//config\`, \`//wrapped\`, \`//speed\`, atau \`//set\` di chat 
 
         // ================= AUTO-CAPTURE MEDIA REPLY (KHUSUS OWNER KE TARGET -> KIRIM KE OWNER) =================
         if (isEnabled("auto_capture") && isTargetChat && isOwnerOrSelf && quotedMedia && ["image", "video", "audio"].includes(quotedMedia.kind)) {
-          const buffer = await downloadStreamToBuffer(quotedMedia.msg, quotedMedia.kind)
-          const isVO = isViewOnceMessage(quoted)
-          const vaultPath = isEnabled("auto_vault")
-            ? saveToMemoryVault({
-                msgId: contextInfo?.stanzaId || `reply_${Date.now()}`,
-                source: isVO ? "viewonce" : "reply",
-                media: quotedMedia,
-                buffer,
-                caption: extractTextFromMessage(quoted)
-              })
-            : null
-          const caption =
-            `👀 *AUTO-CAPTURE TARGET (${quotedMedia.kind.toUpperCase()}${isVO ? " • VIEW-ONCE" : ""})*\n` +
-            `Nomor: ${chatInfo.number || getTargetNumber()}\n` +
-            `LID: ${chatInfo.lid || "-"}\n` +
-            `Vault: ${vaultPath || "-"}`
-          await sendMediaToOwner(sock, quotedMedia, buffer, caption)
+          try {
+            const buffer = await downloadQuotedMediaBuffer(sock, jid, isGroup, contextInfo, quotedCtx)
+            const vaultPath = isEnabled("auto_vault")
+              ? saveToMemoryVault({
+                  msgId: contextInfo?.stanzaId || `reply_${Date.now()}`,
+                  source: isQuotedVO ? "viewonce" : "reply",
+                  media: quotedMedia,
+                  buffer,
+                  caption: quotedText
+                })
+              : null
+            const caption =
+              `👀 *AUTO-CAPTURE TARGET (${quotedMedia.kind.toUpperCase()}${isQuotedVO ? " • VIEW-ONCE" : ""})*\n` +
+              `Nomor: ${chatInfo.number || getTargetNumber()}\n` +
+              `LID: ${chatInfo.lid || "-"}\n` +
+              `Vault: ${vaultPath || "-"}`
+            await sendMediaToOwner(sock, quotedMedia, buffer, caption)
+          } catch (err) {
+            console.error("Auto-capture error:", err.message)
+            await sendToOwner(sock, {
+              text:
+                `⚠️ *AUTO-CAPTURE GAGAL (${quotedMedia.kind.toUpperCase()}${isQuotedVO ? " • VIEW-ONCE" : ""})*\n` +
+                `Alasan: ${err.message}`
+            })
+          }
         }
       } catch (e) {
         console.error("Error:", e.message)
